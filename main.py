@@ -16,12 +16,8 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- Точная проверка: свободен ли ник ---
+# --- Проверка: свободен ли ник ---
 async def check_username(session: aiohttp.ClientSession, username: str) -> bool:
-    """
-    Возвращает True только если ник РЕАЛЬНО свободен.
-    Проверяем 2 источника: t.me и fragment.com
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -29,52 +25,37 @@ async def check_username(session: aiohttp.ClientSession, username: str) -> bool:
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    # 1) t.me — если есть страница профиля, ник занят
+    # 1) t.me
     try:
         async with session.get(
             f"https://t.me/{username}",
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=8),
+            timeout=aiohttp.ClientTimeout(total=6),
             allow_redirects=True,
         ) as resp:
             text = await resp.text()
-            # Признаки существующего профиля/канала
             if "tgme_page_title" in text or "tgme_page_extra" in text:
                 return False
-            # Заглушка "If you have Telegram, you can contact..."
-            if resp.status == 200 and "tgme_page" not in text:
-                pass  # пустая — потенциально свободен
-            if resp.status == 404:
-                pass  # свободен
-    except Exception as e:
-        logging.warning(f"t.me error {username}: {e}")
-        return False  # если не смогли проверить — не выдаём
+    except Exception:
+        return False
 
-    # 2) fragment.com — там все занятые/продающиеся ники
+    # 2) fragment.com
     try:
         async with session.get(
             f"https://fragment.com/username/{username}",
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=8),
+            timeout=aiohttp.ClientTimeout(total=6),
             allow_redirects=True,
         ) as resp:
             text = await resp.text()
             if resp.status == 200:
                 low = text.lower()
-                # Если карточка ника существует (taken/sold/auction) — занят
                 if any(k in low for k in ["taken", "sold", "auction", "on sale", "for sale"]):
                     return False
-                # Если явно "unavailable" — свободен
-                if "unavailable" in low:
-                    return True
-                # Если страница не о нике — свободен
-                if "username" not in low:
-                    return True
                 return True
             if resp.status == 404:
                 return True
-    except Exception as e:
-        logging.warning(f"fragment error {username}: {e}")
+    except Exception:
         return False
 
     return True
@@ -142,42 +123,56 @@ async def auto_menu_handler(callback: CallbackQuery):
 async def check_length(callback: CallbackQuery):
     length = int(callback.data.split(":")[1])
 
-    searching_text = (
+    await callback.message.edit_text(
         "🔍 <b>ГЕНЕРИРУЮ И ПРОВЕРЯЮ</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"▸ Длина: [{length}]\n"
         "▸ Отбираю самые красивые\n\n"
         "⚡ Секунду..."
     )
-    await callback.message.edit_text(searching_text)
 
-    attempts = 0
+    total_attempts = 0
     found = None
+    checked = set()
 
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(limit=60)
+    async with aiohttp.ClientSession(connector=connector) as session:
         while found is None:
-            attempts += 1
-            username = generate_username(length)
+            # Генерируем пачку из 40 ников
+            batch = []
+            while len(batch) < 40:
+                u = generate_username(length)
+                if u not in checked:
+                    checked.add(u)
+                    batch.append(u)
 
-            await asyncio.sleep(0.4)
+            # Проверяем все параллельно
+            results = await asyncio.gather(
+                *[check_username(session, u) for u in batch],
+                return_exceptions=True,
+            )
+            total_attempts += len(batch)
 
-            if await check_username(session, username):
-                found = username
-                logging.info(f"✅ Свободен: @{username} (попыток: {attempts})")
-            else:
-                logging.info(f"❌ Занят: @{username}")
+            # Берём ПЕРВЫЙ свободный
+            for u, ok in zip(batch, results):
+                if ok is True:
+                    found = u
+                    break
 
-            if attempts % 25 == 0:
-                try:
-                    await callback.message.edit_text(
-                        "🔍 <b>ГЕНЕРИРУЮ И ПРОВЕРЯЮ</b>\n"
-                        "━━━━━━━━━━━━━━━━━━\n\n"
-                        f"▸ Длина: [{length}]\n"
-                        "▸ Отбираю самые красивые\n\n"
-                        f"⚡ Проверено: {attempts}..."
-                    )
-                except Exception:
-                    pass
+            if found:
+                break
+
+            # Обновляем статус
+            try:
+                await callback.message.edit_text(
+                    "🔍 <b>ГЕНЕРИРУЮ И ПРОВЕРЯЮ</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n\n"
+                    f"▸ Длина: [{length}]\n"
+                    "▸ Отбираю самые красивые\n\n"
+                    f"⚡ Проверено: {total_attempts}..."
+                )
+            except Exception:
+                pass
 
     result_text = (
         "✅ <b>СВОБОДНЫЙ НИК</b>\n"
@@ -185,7 +180,7 @@ async def check_length(callback: CallbackQuery):
         "💎 <b>Твой ник:</b>\n\n"
         f"🟢 <code>@{found}</code>\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"▸ Проверено: {attempts}\n\n"
+        f"▸ Проверено: {total_attempts}\n\n"
         "⚠️ <b>Занимай быстрее!</b>"
     )
 
